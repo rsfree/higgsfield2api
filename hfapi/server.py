@@ -25,13 +25,14 @@ from fastapi import FastAPI, Header, Request as HttpRequest
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .convert import TERMINAL, build_params, job_to_task, parse_request, wrap_body
+from .convert import TERMINAL, build_params, job_to_task, parse_request, preview, wrap_body
 from .errors import (
     CODE_AUTH,
     CODE_BILLING_OFF,
     CODE_INTERNAL,
     ApiError,
 )
+from . import panel
 from .store import Store
 from .upstream import Upstream
 
@@ -40,14 +41,26 @@ store = Store()
 upstream = Upstream()
 _bg: set[asyncio.Task] = set()
 
+app.include_router(panel.router)
+
 OPEN_PATHS = {"/healthz"}
 
 
 @app.middleware("http")
-async def _require_token(request: HttpRequest, call_next: Any) -> Any:
-    """可选 Bearer 鉴权。中间件里不能抛 ApiError（异常处理器在中间件内层），直接回 JSONResponse。"""
+async def _gate(request: HttpRequest, call_next: Any) -> Any:
+    """两道门：`/panel*` 走面板口令（cookie），其余接口走 Bearer token。
+
+    中间件里不能抛 ApiError（异常处理器在中间件内层），一律直接回 JSONResponse。
+    """
+    path = request.url.path
+    if request.method == "OPTIONS" or path in OPEN_PATHS:
+        return await call_next(request)
+
+    if path == "/panel" or path.startswith("/panel/"):
+        return await panel.guard(request, call_next)
+
     token = settings.service_token
-    if not token or request.url.path in OPEN_PATHS or request.method == "OPTIONS":
+    if not token:
         return await call_next(request)
 
     auth = (request.headers.get("authorization") or "").strip()
@@ -101,8 +114,9 @@ async def admin_reload() -> dict[str, Any]:
 
 
 async def _session_probe() -> dict[str, Any]:
+    # whoami 是同步的 curl_cffi 调用，直接 await 会卡住整个事件循环（/healthz 一起卡）
     try:
-        return upstream.session.whoami()
+        return await asyncio.to_thread(upstream.session.whoami)
     except ApiError as exc:
         return {"ok": False, "status": exc.http_status, "detail": exc.message}
 
@@ -119,7 +133,7 @@ async def create_task(
     params = build_params(req)
 
     if x_dry_run and x_dry_run.strip().lower() in {"1", "true", "yes"}:
-        return JSONResponse(status_code=200, content=_preview(req, params))
+        return JSONResponse(status_code=200, content=preview(req, params))
 
     if not settings.allow_billing:
         raise ApiError(
@@ -138,7 +152,7 @@ async def create_task(
 
     # 提交期失败会直接抛 ApiError（没有 id，改参数重试是有意义的）；
     # 网络超时绝不重发：{id} 是唯一幂等键，重发就是两个计费任务。
-    data = upstream.create(body_out, dry_run=False)
+    data = await asyncio.to_thread(upstream.create, body_out, dry_run=False)
 
     job_set_id = data.get("id") or data.get("job_set_id")
     jobs = data.get("jobs") if isinstance(data.get("jobs"), list) else []
@@ -153,6 +167,7 @@ async def create_task(
     task = {
         "id": str(job_id),
         "model": req.model_echo,
+        "prompt": req.prompt,
         "status": "queued",
         "created_at": now,
         "updated_at": now,
@@ -175,22 +190,11 @@ async def create_task(
     return JSONResponse(status_code=200, content={"id": str(job_id)})
 
 
-def _preview(req: Any, params: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "dry_run": True,
-        "upstream_url": f"{settings.gateway}/jobs/v2/magi_2",
-        "upstream_body": wrap_body(params, settings.use_free_gens),
-        "mode": req.mode,
-        "warnings": req.warnings,
-        "will_charge": settings.allow_billing,
-    }
-
-
 @app.post("/admin/dry-run")
 async def admin_dry_run(body: dict[str, Any]) -> dict[str, Any]:
     """零计费的等价入口：同一套校验/翻译，不碰上游、不花钱。"""
     req = parse_request(body)
-    return _preview(req, build_params(req))
+    return preview(req, build_params(req))
 
 
 # --------------------------------------------------------------------------- 查询
@@ -203,7 +207,7 @@ async def get_task(task_id: str) -> dict[str, Any]:
     submitted = int((row or {}).get("submitted_at") or time.time())
 
     try:
-        job = upstream.get_job(str(job_id))
+        job = await asyncio.to_thread(upstream.get_job, str(job_id))
     except ApiError as exc:
         if exc.http_status == 404:
             if row:

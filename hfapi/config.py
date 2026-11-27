@@ -70,5 +70,14 @@ class Settings:
     def cookie_path(self) -> Path:
         return self.cookies_file
 
+    @property
+    def panel_password(self) -> str:
+        """面板登录口令。默认复用 SERVICE_TOKEN（一个口令管 API + 面板），也可单独指定。"""
+        return (os.getenv("PANEL_PASSWORD") or "").strip() or self.service_token
+
+    @property
+    def panel_enabled(self) -> bool:
+        return bool(self.panel_password)
+
 
 settings = Settings()

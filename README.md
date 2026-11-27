@@ -119,6 +119,22 @@ curl -s https://<host>/admin/session -H "Authorization: Bearer $SERVICE_TOKEN"
 
 `SERVICE_TOKEN` 为空时不做鉴权 —— **该模式只能绑回环地址**，否则任何人都能拿你的额度建任务。
 
+### 运维面板 `/panel`
+
+登录口令 = `PANEL_PASSWORD`，未单独配置时复用 `SERVICE_TOKEN`（一个口令管 API + 面板）。
+
+| 能力 | 说明 |
+|---|---|
+| 总览 | 计费开关、上游会话、台账计数、护栏值 —— 全部只读 |
+| 任务台账 | 最近 50 条：状态 / 时长 / 比例 / prompt / 产物链接，可单条回源刷新 |
+| 报文干跑 | 表单直接产出真实上游报文，零计费 |
+| cookie 导入 | 粘贴 DevTools 的「Copy as cURL」→ 写盘 → 立即自检，不必登服务器 |
+| 刻意不做 | **开计费开关**。`ALLOW_BILLING` 只能改 `.env` 重启，让"花钱"不会是一次误点 |
+
+面板会话是 `HttpOnly + SameSite=Strict` 的签名 cookie（HMAC 密钥即口令，改口令即全端下线），
+连续 8 次口令错误锁 5 分钟；`PANEL_PASSWORD` 与 `SERVICE_TOKEN` 都为空时面板直接 503 关闭，
+不存在「无口令的 cookie 上传入口」。
+
 ---
 
 ## 六、这两次免费额度 + 10 积分怎么花

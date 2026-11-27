@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,19 @@ def parse_cookies(raw: str, *, source: str = "cookie") -> dict[str, str]:
     if not out:
         raise ApiError(CODE_AUTH, f"{source} 无法解析", 401, param="cookie")
     return out
+
+
+def cookies_from_curl(text: str) -> dict[str, str]:
+    """从 DevTools「Copy as cURL」里抠 cookie 头——只有这条路能拿到 HttpOnly 的 __client。"""
+    m = re.search(r"-H\s+'cookie:\s*([^']+)'", text, re.I) or re.search(r'-H\s+"cookie:\s*([^"]+)"', text, re.I)
+    if not m:
+        raise ApiError(
+            CODE_AUTH,
+            "这段文本里没有 `-H 'cookie: …'`。请在登录态下对任意 XHR 请求右键 Copy as cURL",
+            400,
+            param="curl",
+        )
+    return parse_cookies(m.group(1).replace("\n", " "), source="curl cookie 头")
 
 
 def load_cookies(path: Path | None = None) -> dict[str, str]:

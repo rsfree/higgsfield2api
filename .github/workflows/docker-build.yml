@@ -75,6 +75,15 @@ jobs:
           check 200 "dry-run 零计费翻译"            -X POST "$URL/admin/dry-run" -H 'Authorization: Bearer smoke-token' -H 'Content-Type: application/json' -d "$BODY"
           check 400 "非法分辨率被拒"                -X POST "$URL/admin/dry-run" -H 'Authorization: Bearer smoke-token' -H 'Content-Type: application/json' -d '{"model":"magi_2","content":[{"type":"text","text":"x"}],"resolution":"720p"}'
 
+          # 面板：未登录必须跳登录页，面板 API 必须 401，登录后必须能读 state
+          check 303 "面板未登录跳转"                "$URL/panel"
+          check 200 "登录页可访问"                  "$URL/panel/login"
+          check 401 "面板 API 未登录"               "$URL/panel/api/state"
+          JAR=$(mktemp)
+          curl -s -c "$JAR" -o /dev/null -X POST "$URL/panel/login" -d 'password=smoke-token'
+          check 200 "面板登录后 state"              -b "$JAR" "$URL/panel/api/state"
+          check 401 "面板 cookie 不能读 /tasks"     -b "$JAR" "$URL/tasks"
+
           docker rm -f smoke >/dev/null
 
       - name: 登录 GHCR

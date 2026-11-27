@@ -310,6 +310,18 @@ def wrap_body(params: dict[str, Any], use_free_gens: bool) -> dict[str, Any]:
     return body
 
 
+def preview(req: "Request", params: dict[str, Any]) -> dict[str, Any]:
+    """零计费预览：把要发给上游的报文原样吐出来，API 与面板共用同一份。"""
+    return {
+        "dry_run": True,
+        "upstream_url": f"{settings.gateway}/jobs/v2/{UPSTREAM_JOB_TYPE}",
+        "upstream_body": wrap_body(params, settings.use_free_gens),
+        "mode": req.mode,
+        "warnings": req.warnings,
+        "will_charge": settings.allow_billing,
+    }
+
+
 # --------------------------------------------------------------------------- 任务对象
 
 def _first_url(node: Any) -> str | None:
@@ -390,6 +402,8 @@ def job_to_task(
             task["ratio"] = params["aspect_ratio"]
         if isinstance(params.get("batch_size"), int):
             task["batch_size"] = params["batch_size"]
+        if isinstance(params.get("prompt"), str) and params["prompt"]:
+            task["prompt"] = params["prompt"]
 
     if status == "succeeded" and url:
         task["content"] = {"video_url": url}

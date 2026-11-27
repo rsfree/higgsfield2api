@@ -15,6 +15,7 @@
 | 数据卷 | `higgsfield2api_hfdata`（sqlite 台账）、`higgsfield2api_hfsecrets`（cookies.json） |
 | 公网入口 | `https://higgsfield2api.1task.cn`（nginx 反代 + acme.sh 证书） |
 | 鉴权 | `SERVICE_TOKEN` 必填，`Authorization: Bearer <token>` |
+| 面板 | `https://higgsfield2api.1task.cn/panel`，口令 = `PANEL_PASSWORD`（空则复用 `SERVICE_TOKEN`） |
 | 计费开关 | `ALLOW_BILLING=0`（默认关；开=真花钱，见 §7） |
 
 ---
@@ -101,6 +102,14 @@ chmod 600 .env
 
 服务没有 cookie 时 `/healthz` 正常，但 `/admin/session` 与建任务都会 401 —— 这是“活着但没钥匙”，不是故障。
 
+**推荐路径：面板导入**（不必登服务器）
+
+1. 浏览器登录 `higgsfield.ai` → DevTools → Network → 任意 XHR → 右键 **Copy as cURL**；
+2. 打开 `https://<域名>/panel` → 「上游会话」→ 粘贴 → **导入并自检**；
+3. 看返回：`session.ok=true` 即通；`missing` 里若出现 `__client`，说明贴的是 `document.cookie`（拿不到 HttpOnly）。
+
+**命令行等价路径**（脚本化 / 无浏览器时）
+
 ```bash
 cd /opt/higgsfield2api
 docker compose up -d
@@ -151,7 +160,15 @@ curl -s -X POST $B/admin/dry-run -H "Authorization: Bearer $TOKEN" \
   -d '{"model":"magi_2","content":[{"type":"text","text":"一只橘猫"}],"duration":4,"ratio":"16:9"}'
 # dry_run=true, will_charge=false
 
-# 5) 公网入口（证书就位后）
+# 5) 面板：未登录必须 303 到登录页，API 必须 401
+curl -s -o /dev/null -w '%{http_code}\n' https://higgsfield2api.1task.cn/panel          # 303
+curl -s -o /dev/null -w '%{http_code}\n' https://higgsfield2api.1task.cn/panel/api/state # 401
+
+# 6) 面板登录（口令 = PANEL_PASSWORD）
+curl -s -c /tmp/p.txt -o /dev/null -w '%{http_code}\n' -X POST https://higgsfield2api.1task.cn/panel/login -d 'password=<口令>'
+curl -s -b /tmp/p.txt https://higgsfield2api.1task.cn/panel/api/state | head -c 200
+
+# 7) 公网入口
 curl -s https://higgsfield2api.1task.cn/healthz
 curl -s -o /dev/null -w '%{http_code}\n' https://higgsfield2api.1task.cn/tasks   # 401 = 鉴权生效
 ```
@@ -260,6 +277,8 @@ sed -i 's/^TAG=.*/TAG=sha-<旧sha7>/' .env && docker compose up -d
 
 - [x] 容器端口绑 `127.0.0.1`，公网只走 nginx
 - [x] `SERVICE_TOKEN` 已设置（`/healthz` 的 `auth_required` 为 `true`）
+- [x] `PANEL_PASSWORD` 已设置；面板 `/panel/api/*` 未登录返回 401，`/tasks` 不因面板 cookie 而放行
+- [x] 面板**不能**开关计费：`ALLOW_BILLING` 只认 `.env` + 重启
 - [x] `ALLOW_BILLING` 与 `MAX_BATCH` / `MAX_DURATION` 三件套按需收紧
 - [x] `.env`、`secrets/` 权限 `600`，不进 git、不进镜像
 - [x] 不带 token 的请求返回 401（§6 第 2 条）
