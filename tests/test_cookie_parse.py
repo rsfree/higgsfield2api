@@ -50,7 +50,34 @@ def test_bearer_only_curl_is_rejected_with_real_reason() -> None:
 def test_plain_curl_without_cookie_is_rejected() -> None:
     with pytest.raises(ApiError) as ei:
         cookies_from_curl("curl 'https://fnf-api-gw.higgsfield.ai/fnf/jobs?size=1' -H 'accept: */*'")
-    assert "没有 `-H 'cookie" in ei.value.message
+    assert "-H 'cookie" in ei.value.message
+    assert "-b" in ei.value.message  # 提示里要同时给出两种可接受形态
+
+
+def test_dash_b_form_is_parsed() -> None:
+    """Chrome「Copy as cURL」默认导出 `-b '…'`，不是 `-H 'cookie: …'`。
+
+    真实事故（2026-11-27）：面板声明支持 `-b`，但解析器只认 `-H 'cookie:'`，
+    用户从 `_clerk/v1/client/sessions/*/tokens` 复制的正确凭据被误判成「没有 cookie 头」。
+    """
+    text = (
+        "curl --url 'https://higgsfield.ai/_clerk/v1/client/sessions/sess_x/tokens' \\\n"
+        "  -H 'accept: */*' \\\n"
+        '  -b \'__client=aaa.bbb.ccc; __client_uat=1795758955; hf-tier=T2; $$__device-id=u-1\' \\\n'
+        "  --data-raw 'token=x'"
+    )
+    ck = cookies_from_curl(text)
+    assert ck["__client"] == "aaa.bbb.ccc"
+    assert ck["__client_uat"] == "1795758955"
+    assert ck["hf-tier"] == "T2"
+    assert ck["$$__device-id"] == "u-1"
+
+
+def test_long_cookie_value_with_dots_and_dashes_survives() -> None:
+    """JWT 形态的 __client 含 . - _，不能被截断。"""
+    val = "eyJhbGciOiJSUzI1NiJ9.eyJpZCI6ImNsaWVudF94In0.X5nn-BpD_p-RlE"
+    ck = cookies_from_curl(f"curl 'https://x' -b '__client={val}; a=b'")
+    assert ck["__client"] == val
 
 
 def test_require_session_cookies_blocks_junk() -> None:

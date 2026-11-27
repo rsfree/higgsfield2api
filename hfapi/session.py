@@ -89,8 +89,18 @@ def looks_like_curl(text: str) -> bool:
 
 
 def cookies_from_curl(text: str) -> dict[str, str]:
-    """从 DevTools「Copy as cURL」里抠 cookie 头——只有这条路能拿到 HttpOnly 的 __client。"""
-    m = re.search(r"-H\s+'cookie:\s*([^']+)'", text, re.I) or re.search(r'-H\s+"cookie:\s*([^"]+)"', text, re.I)
+    """从 DevTools「Copy as cURL」里抠 cookie——只有这条路能拿到 HttpOnly 的 __client。
+
+    DevTools 导出的形态有两种，都要认：
+      -H 'cookie: __client=…; __client_uat=…'      ← 手工加头 / 某些版本
+      -b '__client=…; __client_uat=…'              ← Chrome「Copy as cURL」的默认形态
+    """
+    m = (
+        re.search(r"-H\s+'cookie:\s*([^']+)'", text, re.I)
+        or re.search(r'-H\s+"cookie:\s*([^"]+)"', text, re.I)
+        or re.search(r"(?:^|\s)(?:-b|--cookie)\s+'([^']+)'", text)
+        or re.search(r'(?:^|\s)(?:-b|--cookie)\s+"([^"]+)"', text)
+    )
     if not m:
         if re.search(r"authorization:\s*['\"]?\s*bearer\s+eyJ", text, re.I):
             raise ApiError(
@@ -99,8 +109,13 @@ def cookies_from_curl(text: str) -> dict[str, str]:
                 400,
                 param="curl",
             )
-        raise ApiError(CODE_AUTH, "这段文本里没有 `-H 'cookie: …'`。" + _CURL_HOWTO, 400, param="curl")
-    return parse_cookies(m.group(1).replace("\n", " "), source="curl cookie 头")
+        raise ApiError(
+            CODE_AUTH,
+            "这段文本里既没有 `-H 'cookie: …'` 也没有 `-b '…'`。" + _CURL_HOWTO,
+            400,
+            param="curl",
+        )
+    return parse_cookies(m.group(1).replace("\n", " "), source="curl cookie")
 
 
 def require_session_cookies(cookies: dict[str, str], *, source: str = "cookie") -> dict[str, str]:
