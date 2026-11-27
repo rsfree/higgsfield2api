@@ -1,0 +1,11 @@
+.env
+secrets/
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.tar.gz
+.DS_Store
+.idea/

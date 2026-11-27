@@ -1,0 +1,43 @@
+# higgsfield2api · 单机部署声明（ai-prod）
+#
+# 镜像由 .github/workflows/docker-build.yml 构建 → 冒烟 → 推送 ghcr.io/rsfree/higgsfield2api
+#   tag：latest / <branch> / sha-<7位>，打 v* tag 时额外产出 semver
+#   仓库为 private ⇒ 节点需先 docker login ghcr.io（ai-prod 已登录）
+#
+# 🔴 端口只绑回环。ai-prod 的 ufw 放行 39000-40000 整段，绑 0.0.0.0 就是把
+#    「能花账号额度」的入口裸到公网。公网入口一律 nginx + higgsfield2api.1task.cn。
+#
+# 卷：data 存 sqlite 台账，secrets 存 cookies.json。
+#   用具名卷而不是 bind mount —— 容器以 uid 10001 运行，bind mount 会被宿主机
+#   属主卡成只读，每次部署都要 chown，得不偿失。
+name: higgsfield2api
+
+services:
+  higgsfield2api:
+    image: ghcr.io/rsfree/higgsfield2api:${TAG:-latest}
+    container_name: higgsfield2api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:39420:8000"      # 仅回环；跨机调试走 SSH 隧道
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - hfdata:/app/data
+      - hfsecrets:/app/secrets
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  hfdata:
+  hfsecrets:

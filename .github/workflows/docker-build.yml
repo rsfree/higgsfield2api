@@ -1,0 +1,115 @@
+name: docker-build
+
+# 顺序固定：构建 → 冒烟 → 才推送。buildx 不能同时 load 与 push，
+# 所以推送单独用 docker tag + docker push，坏镜像绝不进 registry。
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        name: 解析镜像名与短 sha
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "sha7=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "branch=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建（只 load，不推）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: higgsfield2api:ci
+          build-args: |
+            VERSION=sha-${{ steps.meta.outputs.sha7 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 冒烟（健康检查 + 鉴权分支 + 计费闸门）
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 18000:8000 \
+            -e SERVICE_TOKEN=smoke-token -e ALLOW_BILLING=0 higgsfield2api:ci
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18000/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then echo "::error::容器未就绪"; docker logs smoke; exit 1; fi
+
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+          BODY='{"model":"magi_2","content":[{"type":"text","text":"smoke"}],"duration":4}'
+          URL=http://127.0.0.1:18000
+
+          check() { # 期望码 说明 curl参数...
+            local want=$1 label=$2; shift 2
+            local got; got=$(code "$@")
+            echo "$label -> $got (期望 $want)"
+            [ "$got" = "$want" ] || { echo "::error::$label 期望 $want 实得 $got"; docker logs smoke; exit 1; }
+          }
+
+          check 200 "healthz"                      "$URL/healthz"
+          check 401 "无 token 建任务"               -X POST "$URL/contents/generations/tasks" -H 'Content-Type: application/json' -d "$BODY"
+          check 401 "错 token 建任务"               -X POST "$URL/contents/generations/tasks" -H 'Authorization: Bearer wrong' -H 'Content-Type: application/json' -d "$BODY"
+          check 403 "正确 token 但计费关闭"         -X POST "$URL/contents/generations/tasks" -H 'Authorization: Bearer smoke-token' -H 'Content-Type: application/json' -d "$BODY"
+          check 200 "dry-run 零计费翻译"            -X POST "$URL/admin/dry-run" -H 'Authorization: Bearer smoke-token' -H 'Content-Type: application/json' -d "$BODY"
+          check 400 "非法分辨率被拒"                -X POST "$URL/admin/dry-run" -H 'Authorization: Bearer smoke-token' -H 'Content-Type: application/json' -d '{"model":"magi_2","content":[{"type":"text","text":"x"}],"resolution":"720p"}'
+
+          docker rm -f smoke >/dev/null
+
+      - name: 登录 GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 推送
+        if: github.event_name != 'pull_request'
+        env:
+          IMG: ${{ steps.meta.outputs.image }}
+          SHA7: ${{ steps.meta.outputs.sha7 }}
+        run: |
+          set -euo pipefail
+          tags="latest sha-$SHA7"
+          case "$GITHUB_REF" in
+            refs/heads/*)  tags="$tags ${GITHUB_REF_NAME//\//-}" ;;
+            refs/tags/v*)  tags="$tags ${GITHUB_REF_NAME#v}" ;;   # v1.2.3 -> 1.2.3
+            refs/tags/*)   tags="$tags ${GITHUB_REF_NAME//\//-}" ;;
+          esac
+          for t in $tags; do
+            docker tag higgsfield2api:ci "$IMG:$t"
+            docker push "$IMG:$t"
+          done
+
+      - name: 离线兜底镜像包
+        if: github.event_name != 'pull_request'
+        run: docker save higgsfield2api:ci | gzip -9 > higgsfield2api-ci.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: image-tar-${{ steps.meta.outputs.sha7 }}
+          path: higgsfield2api-ci.tar.gz
+          retention-days: 7
