@@ -225,10 +225,60 @@ class AccountPool:
         self.path = path or settings.accounts_file
         self._lock = threading.RLock()
         self._accounts: dict[str, Account] = {}
+        self._stamp: tuple[int, int] | None = None
         self.load_warning = ""
         self._load()
         if not self._accounts:
             self._import_legacy()
+        self._stamp = self._stamp_now()
+
+    # -- 运行时与磁盘的一致性
+    def _stamp_now(self) -> tuple[int, int] | None:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _sync_from_disk(self) -> None:
+        """外部进程改过 accounts.json 时合并进来。
+
+        为什么需要：`tools/cookie_import` 是**独立进程**，写的是同一个文件。
+        服务进程若只在启动时读一次，就会出现「CLI 说已加入号池，/healthz 仍显示 0」——
+        当前进程完全不知道新号存在，用户以为导成功了。面板走的是同进程 API，不受影响。
+
+        为什么是合并而不是整体替换：在飞计数、冷却截止、JWT 缓存都是内存运行态，
+        整体替换会把它们清零 —— 正在跑的任务会被重复派发到同一个号上。
+        """
+        cur = self._stamp_now()
+        if cur is None or cur == self._stamp:
+            return
+        self._stamp = cur  # 先占位：即使解析失败也不要每次请求都重试读盘
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            items = data.get("accounts") if isinstance(data, dict) else data
+            incoming = {a.id: a for a in (Account.from_dict(x) for x in (items or []))}
+        except FileNotFoundError:
+            return
+        except Exception as exc:  # noqa: BLE001 半个文件（并发写）不该清空内存池
+            log.warning("号池热重载跳过（文件暂不可解析）：%s", exc)
+            return
+
+        with self._lock:
+            for aid, acc in incoming.items():
+                mine = self._accounts.get(aid)
+                if mine is None:
+                    self._accounts[aid] = acc
+                    log.info("号池热重载：新增 %s（%s）", aid, acc.name)
+                    continue
+                if mine.cookies != acc.cookies:
+                    mine.set_cookies(acc.cookies)
+                    log.info("号池热重载：%s 凭据已更新", aid)
+                mine.name = acc.name
+                mine.enabled = acc.enabled
+            for aid in [a for a in self._accounts if a not in incoming]:
+                self._accounts.pop(aid, None)
+                log.info("号池热重载：移除 %s", aid)
 
     # -- 持久化
     def _load(self) -> None:
@@ -271,6 +321,7 @@ class AccountPool:
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
+            self._stamp = self._stamp_now()  # 自己的写入不该被当成外部变更
         except OSError as exc:
             # 落盘失败不能影响正在跑的任务，但必须留痕
             log.error("号池写盘失败：%s", exc)
@@ -296,18 +347,21 @@ class AccountPool:
 
     # -- 增删查
     def list(self) -> list[Account]:
+        self._sync_from_disk()
         with self._lock:
             return list(self._accounts.values())
 
     def get(self, account_id: str | None) -> Account | None:
         if not account_id:
             return None
+        self._sync_from_disk()
         with self._lock:
             return self._accounts.get(account_id)
 
     def add(self, cookies: dict[str, str], *, name: str = "", enabled: bool = True) -> Account:
         if not cookies:
             raise ApiError("InvalidParameter", "cookie 为空", 400, param="cookie")
+        self._sync_from_disk()
         with self._lock:
             acc = Account(
                 id=self._unique_id(),
@@ -328,6 +382,7 @@ class AccountPool:
         raise ApiError("InternalServiceError", "账号 id 生成冲突", 500)
 
     def remove(self, account_id: str) -> bool:
+        self._sync_from_disk()
         with self._lock:
             if self._accounts.pop(account_id, None) is None:
                 return False
@@ -379,6 +434,7 @@ class AccountPool:
     # -- 调度
     def acquire(self, exclude: frozenset[str] = frozenset()) -> Account:
         """取出一个可用账号并**占用**（inflight +1）。用完必须 `release`。"""
+        self._sync_from_disk()
         with self._lock:
             now = _now()
             cands = [a for a in self._accounts.values() if a.id not in exclude and a.usable(now)]
@@ -393,6 +449,7 @@ class AccountPool:
 
     def pick(self, preferred: str | None = None) -> Account | None:
         """只读查询用：不占 inflight，允许挑一个当前不可用但曾经正常的号。"""
+        self._sync_from_disk()
         with self._lock:
             if preferred and preferred in self._accounts:
                 return self._accounts[preferred]
@@ -498,12 +555,14 @@ class AccountPool:
             self._load()
             if not self._accounts:
                 self._import_legacy()
+            self._stamp = self._stamp_now()
             after = set(self._accounts)
             return {"loaded": len(after), "added": sorted(after - before),
                     "removed": sorted(before - after), "warning": self.load_warning}
 
     # -- 概览
     def summary(self) -> dict[str, Any]:
+        self._sync_from_disk()
         now = _now()
         accs = self.list()
         states = [a.health(now)[0] for a in accs]

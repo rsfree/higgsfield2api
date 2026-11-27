@@ -349,3 +349,99 @@ def test_all_invalid_pool_reports_breakdown(mkpool, monkeypatch, billing_on) -> 
     assert r.status_code == 503
     msg = r.json()["error"]["message"]
     assert "失效 1" in msg, f"要给出明细，实际：{msg}"
+
+
+def test_external_write_is_picked_up_without_restart(tmp_path: Path) -> None:
+    """CLI（独立进程）写的号池，服务进程必须能看见。
+
+    真实事故（2026-11-27）：`tools/cookie_import` 报「已加入号池」，
+    `/healthz` 仍 accounts_total=0 —— 服务进程只在启动时读过一次文件。
+    """
+    path = tmp_path / "hot.json"
+    pool = AccountPool(path)
+    assert pool.list() == []
+
+    path.write_text(json.dumps({"version": 1, "accounts": [
+        {"id": "acc-cli", "name": "cli", "cookies": COOKIES_A, "enabled": True, "created_at": 1}
+    ]}), encoding="utf-8")
+
+    assert [a.id for a in pool.list()] == ["acc-cli"]
+    assert pool.summary()["total"] == 1
+    assert pool.acquire().id == "acc-cli"
+
+
+def test_hot_reload_merges_and_keeps_runtime_state(tmp_path: Path) -> None:
+    """外部换凭据要生效，但正在飞的任务计数不能被清零（否则会重复派发）。"""
+    import os
+
+    path = tmp_path / "hot2.json"
+    pool = AccountPool(path)
+    acc = pool.add(COOKIES_A, name="a")
+    acc._inflight = 2
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["accounts"][0]["cookies"] = COOKIES_B
+    data["accounts"][0]["name"] = "renamed"
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    bump = time.time_ns() + 10 ** 6
+    os.utime(path, ns=(bump, bump))
+
+    got = pool.get(acc.id)
+    assert got is not None
+    assert got.name == "renamed"
+    assert got.cookies == COOKIES_B
+    assert got._inflight == 2, "运行态必须保留"
+
+    # 外部删号 → 内存同步移除
+    path.write_text(json.dumps({"version": 1, "accounts": []}), encoding="utf-8")
+    bump += 10 ** 6
+    os.utime(path, ns=(bump, bump))
+    assert pool.list() == []
+
+
+def test_external_write_is_picked_up_without_restart(tmp_path: Path) -> None:
+    """CLI（独立进程）写的号池，服务进程必须能看见。
+
+    真实事故（2026-11-27）：`tools/cookie_import` 报「已加入号池」，
+    `/healthz` 仍 accounts_total=0 —— 服务进程只在启动时读过一次文件。
+    """
+    path = tmp_path / "hot.json"
+    pool = AccountPool(path)
+    assert pool.list() == []
+
+    path.write_text(json.dumps({"version": 1, "accounts": [
+        {"id": "acc-cli", "name": "cli", "cookies": COOKIES_A, "enabled": True, "created_at": 1}
+    ]}), encoding="utf-8")
+
+    assert [a.id for a in pool.list()] == ["acc-cli"]
+    assert pool.summary()["total"] == 1
+    assert pool.acquire().id == "acc-cli"
+
+
+def test_hot_reload_merges_and_keeps_runtime_state(tmp_path: Path) -> None:
+    """外部换凭据要生效，但正在飞的任务计数不能被清零（否则会重复派发）。"""
+    import os
+
+    path = tmp_path / "hot2.json"
+    pool = AccountPool(path)
+    acc = pool.add(COOKIES_A, name="a")
+    acc._inflight = 2
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["accounts"][0]["cookies"] = COOKIES_B
+    data["accounts"][0]["name"] = "renamed"
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    bump = time.time_ns() + 10 ** 6
+    os.utime(path, ns=(bump, bump))
+
+    got = pool.get(acc.id)
+    assert got is not None
+    assert got.name == "renamed"
+    assert got.cookies == COOKIES_B
+    assert got._inflight == 2, "运行态必须保留"
+
+    # 外部删号 → 内存同步移除
+    path.write_text(json.dumps({"version": 1, "accounts": []}), encoding="utf-8")
+    bump += 10 ** 6
+    os.utime(path, ns=(bump, bump))
+    assert pool.list() == []
