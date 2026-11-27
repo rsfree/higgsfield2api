@@ -121,6 +121,11 @@ class Session:
         self._jwt, self._jwt_exp = "", 0
         return self._cookies
 
+    def set_cookies(self, cookies: dict[str, str]) -> None:
+        """直接注入 cookie（导入工具用：验证的对象必须是刚写下的那份，而不是默认路径里的旧的）。"""
+        self._cookies = dict(cookies)
+        self._jwt, self._jwt_exp = "", 0
+
     # -- headers
     def base_headers(self) -> dict[str, str]:
         h = {

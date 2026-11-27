@@ -87,8 +87,11 @@ def main() -> None:
     if missing:
         print(f"⚠️ 缺少 {missing} —— Clerk 会话多半拿不到，建议改用 --curl 的方式")
 
+    # 验证对象必须是刚写下的这份 cookie；用默认路径会在 --out 场景下验到旧文件或直接报「不存在」
     try:
-        print(json.dumps(Session().whoami(), ensure_ascii=False, indent=2))
+        s = Session()
+        s.set_cookies(cookies)
+        print(json.dumps(s.whoami(), ensure_ascii=False, indent=2))
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"ok": False, "detail": str(exc)}, ensure_ascii=False, indent=2))
 
