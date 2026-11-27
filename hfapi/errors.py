@@ -65,3 +65,12 @@ def _type_of(status: int) -> str:
         503: "ServiceUnavailable",
         504: "GatewayTimeout",
     }.get(status, "InternalServerError")
+
+
+def is_upstream_401(exc: "ApiError") -> bool:
+    """上游明确说「这个 cookie 失效」，而不是网关自己连不上上游。
+
+    两者都会抛 CODE_AUTH：前者是我们该换号，后者换号没用（全都不通），
+    混为一谈会让一次网络抖动把所有号一起判死。
+    """
+    return exc.code == CODE_AUTH and int((exc.upstream or {}).get("http") or 0) == 401

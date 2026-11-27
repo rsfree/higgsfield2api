@@ -6,8 +6,9 @@
   DELETE /tasks/{id}                   未实现（不造假数据，直接 501）
 
   POST   /admin/dry-run                零计费：只翻译 + 校验，打印真实上游报文
-  GET    /admin/session                零计费：验证 cookie / JWT 是否还能用
-  POST   /admin/reload                 零计费：重载 cookie 文件（改完 cookie 不必重启）
+  GET    /admin/session                零计费：号池概览 + 逐号自检
+  GET    /admin/accounts               零计费：号池状态（不探测，秒回）
+  POST   /admin/reload                 零计费：从磁盘重载号池（改完不必重启）
 
 鉴权：设置 SERVICE_TOKEN 后，除 /healthz 外全部端点要求 `Authorization: Bearer <token>`
 （或 `X-Api-Key: <token>`）。未设置时不做鉴权——此模式只能绑回环地址。
@@ -33,6 +34,7 @@ from .errors import (
     ApiError,
 )
 from . import panel
+from .pool import pool
 from .store import Store
 from .upstream import Upstream
 
@@ -87,6 +89,7 @@ async def _api_error(_: HttpRequest, exc: ApiError) -> JSONResponse:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
+    summary = pool.summary()
     return {
         "ok": True,
         "auth_required": bool(settings.service_token),
@@ -94,31 +97,40 @@ async def healthz() -> dict[str, Any]:
         "use_free_gens": settings.use_free_gens,
         "max_duration": settings.max_duration,
         "max_batch": settings.max_batch,
+        # 只给数量，不给账号 id —— healthz 是公开端点
+        "accounts_total": summary["total"],
+        "accounts_usable": summary["usable"],
+    }
+
+
+@app.get("/admin/accounts")
+async def admin_accounts() -> dict[str, Any]:
+    """号池状态快照。不探测上游，纯内存，秒回。"""
+    return {
+        "pool": pool.summary(),
+        "accounts": [a.to_public() for a in pool.list()],
     }
 
 
 @app.get("/admin/session")
-async def admin_session() -> dict[str, Any]:
-    """零计费自检：只打一个 GET /jobs?size=1。"""
-    return await _session_probe()
+async def admin_session(probe: int = 1) -> dict[str, Any]:
+    """零计费自检：号池逐个 GET /jobs?size=1。`probe=0` 只看状态不打上游。"""
+    body: dict[str, Any] = {
+        "pool": pool.summary(),
+        "accounts": [a.to_public() for a in pool.list()],
+    }
+    if probe:
+        # whoami 是同步的 curl_cffi 调用，必须丢线程：直接 await 会锁死事件循环
+        body["probe"] = await asyncio.to_thread(pool.probe_all)
+    return body
 
 
 @app.post("/admin/reload")
 async def admin_reload() -> dict[str, Any]:
-    """重载 cookie（HF_COOKIES_JSON 或 cookie 文件）并立刻自检，省掉一次重启。"""
-    try:
-        upstream.session.reload_cookies()
-    except ApiError as exc:
-        return {"reloaded": False, "ok": False, "status": exc.http_status, "detail": exc.message}
-    return {"reloaded": True, **await _session_probe()}
-
-
-async def _session_probe() -> dict[str, Any]:
-    # whoami 是同步的 curl_cffi 调用，直接 await 会卡住整个事件循环（/healthz 一起卡）
-    try:
-        return await asyncio.to_thread(upstream.session.whoami)
-    except ApiError as exc:
-        return {"ok": False, "status": exc.http_status, "detail": exc.message}
+    """从 data/accounts.json 重读号池并自检，省掉一次重启。"""
+    loaded = await asyncio.to_thread(pool.reload)
+    results = await asyncio.to_thread(pool.probe_all)
+    return {"reloaded": True, **loaded, "probe": results}
 
 
 # --------------------------------------------------------------------------- 创建
@@ -152,7 +164,8 @@ async def create_task(
 
     # 提交期失败会直接抛 ApiError（没有 id，改参数重试是有意义的）；
     # 网络超时绝不重发：{id} 是唯一幂等键，重发就是两个计费任务。
-    data = await asyncio.to_thread(upstream.create, body_out, dry_run=False)
+    # create 内部会按号池换号重试（仅限「上游明确没受理」的失败），返回用了哪个号
+    data, acc_id = await asyncio.to_thread(upstream.create, body_out, dry_run=False)
 
     job_set_id = data.get("id") or data.get("job_set_id")
     jobs = data.get("jobs") if isinstance(data.get("jobs"), list) else []
@@ -177,12 +190,14 @@ async def create_task(
         "batch_size": params["batch_size"],
     }
     store.put(task, job_id=str(job_id), job_set_id=str(job_set_id) if job_set_id else None,
-              callback_url=req.callback_url)
+              callback_url=req.callback_url, account_id=acc_id)
     if x_idempotency_key:
         store.idem_put(x_idempotency_key, str(job_id))
 
     if req.callback_url:
-        t = asyncio.create_task(_poll_and_callback(str(job_id), req.model_echo, now, req.callback_url))
+        t = asyncio.create_task(
+            _poll_and_callback(str(job_id), req.model_echo, now, req.callback_url, acc_id)
+        )
         _bg.add(t)
         t.add_done_callback(_bg.discard)
 
@@ -205,9 +220,10 @@ async def get_task(task_id: str) -> dict[str, Any]:
     job_id = (row or {}).get("job_id") or task_id
     model_echo = (row or {}).get("model") or "magi_2"
     submitted = int((row or {}).get("submitted_at") or time.time())
+    acc_id = (row or {}).get("account_id")
 
     try:
-        job = await asyncio.to_thread(upstream.get_job, str(job_id))
+        job = await asyncio.to_thread(upstream.get_job, str(job_id), acc_id)
     except ApiError as exc:
         if exc.http_status == 404:
             if row:
@@ -246,14 +262,15 @@ async def delete_task(task_id: str) -> JSONResponse:
 
 # --------------------------------------------------------------------------- 回调
 
-async def _poll_and_callback(task_id: str, model_echo: str, submitted: int, callback_url: str) -> None:
+async def _poll_and_callback(task_id: str, model_echo: str, submitted: int, callback_url: str,
+                              account_id: str | None = None) -> None:
     """回调不是唯一来源，轮询兜底；两边共用 job_to_task 同一个序列化函数。"""
     deadline = time.time() + settings.execution_expires_after
     last_status = ""
     async with httpx.AsyncClient(timeout=20) as client:
         while time.time() < deadline:
             try:
-                job = await asyncio.to_thread(upstream.get_job, task_id)
+                job = await asyncio.to_thread(upstream.get_job, task_id, account_id)
                 if isinstance(job.get("jobs"), list) and job["jobs"]:
                     job = job["jobs"][0]
                 task = job_to_task(job, model_echo=model_echo, submitted_at=submitted)

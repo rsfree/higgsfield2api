@@ -16,7 +16,7 @@ import asyncio
 import hashlib
 import hmac
 import json
-import os
+import re
 import time
 from typing import Any
 from urllib.parse import parse_qs
@@ -27,21 +27,20 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from .config import settings
 from .convert import build_params, parse_request, preview
 from .errors import CODE_AUTH, CODE_INVALID, ApiError
-from .session import cookies_from_curl, load_cookies, parse_cookies
+from .pool import pool
+from .panel_html import DASHBOARD
+from .session import cookies_from_curl, parse_cookies
 
 COOKIE = "hfpanel"
 TTL = 7 * 86400
 MAX_BODY = 64 * 1024
+SYNC_PROBE_LIMIT = 3   # 批量导入时同步自检的账号数上限
 
 router = APIRouter()
 
 # 登录失败限速（单进程内存计数，重启即清；够挡住脚本撞库）
 _FAILS: dict[str, tuple[int, float]] = {}
 MAX_FAILS, WINDOW = 8, 300
-
-# 会话自检结果缓存，避免面板轮询把上游当靶子打
-_SESSION: dict[str, Any] = {"at": 0.0, "value": None}
-SESSION_TTL = 60
 
 
 # --------------------------------------------------------------------------- 会话签名
@@ -173,53 +172,154 @@ async def logout() -> Any:
 
 # --------------------------------------------------------------------------- 面板 API
 
-async def _session_snapshot(force: bool = False) -> dict[str, Any]:
-    from . import server  # 延迟导入：server 反向依赖本模块，避免循环
+# --------------------------------------------------------------------------- 号池 API
 
-    now = time.time()
-    if not force and _SESSION["value"] is not None and now - _SESSION["at"] < SESSION_TTL:
-        return _SESSION["value"]
-    # whoami 是同步的 curl_cffi 调用：必须丢线程池，否则面板轮询会把事件循环锁死
+def _split_segments(text: str) -> list[str]:
+    """把一段粘贴内容切成多段。
+
+    DevTools 的「Copy as cURL」多行时每行以 `\\` 续行、每段以 `curl ` 起头，
+    所以按「行首 curl」切就能一批导入多个号。只有一段时原样返回。
+    """
+    parts = [p.strip() for p in re.split(r"(?m)^[ \t]*(?=curl\s)", text) if p.strip()]
+    return parts or ([text.strip()] if text.strip() else [])
+
+
+def _parse_one(segment: str) -> dict[str, str]:
+    if re.search(r"-H\s+['\"]cookie:", segment, re.I) or re.search(r"(?:^|\s)(?:-b|--cookie)\s+['\"]", segment):
+        return cookies_from_curl(segment)
+    return parse_cookies(segment, source="面板输入")
+
+
+def _bad_request(msg: str) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": {"code": CODE_INVALID, "message": msg}})
+
+
+@router.post("/panel/api/accounts/probe-all")
+async def probe_all() -> Any:
+    """逐号零计费自检。串行——并发打上游更容易触发风控。"""
+    results = await asyncio.to_thread(pool.probe_all)
+    return {"probe": results, "accounts": [a.to_public() for a in pool.list()]}
+
+
+@router.get("/panel/api/accounts")
+async def list_accounts() -> dict[str, Any]:
+    return {"pool": pool.summary(), "accounts": [a.to_public() for a in pool.list()]}
+
+
+@router.post("/panel/api/accounts")
+async def add_accounts(request: HttpRequest, name: str = "") -> Any:
+    """新增账号。支持一次粘贴多段 cURL（按行首 curl 自动切分，批量导入）。"""
+    raw = (await request.body())[:MAX_BODY].decode("utf-8", "replace").strip()
+    if not raw:
+        return _bad_request("内容为空：请粘贴 Copy as cURL 或 cookie 字符串")
+
+    segments = _split_segments(raw)
+    added: list[Any] = []
+    errors: list[dict[str, Any]] = []
+    for i, seg in enumerate(segments, 1):
+        try:
+            cookies = _parse_one(seg)
+        except ApiError as exc:
+            errors.append({"index": i, "detail": exc.message})
+            continue
+        label = f"{name}-{i}" if name and len(segments) > 1 else name
+        added.append(pool.add(cookies, name=label))
+
+    if not added:
+        return JSONResponse(status_code=400, content={
+            "error": {"code": CODE_INVALID, "message": "一段都没解析成功"},
+            "errors": errors,
+        })
+
+    # 只同步自检前几个：一个连不通的号要等到超时，批量导入 10 个会让浏览器以为页面卡死。
+    # 剩下的留「未验证」，用户点「全部自检」时走 4 路并发。
+    results = []
+    for acc in added[:SYNC_PROBE_LIMIT]:
+        probe = await asyncio.to_thread(pool.probe, acc.id)
+        results.append({"probe": probe, "account": acc.to_public()})
+    for acc in added[SYNC_PROBE_LIMIT:]:
+        results.append({"probe": None, "account": acc.to_public()})
+    return {"added": len(added), "errors": errors, "results": results,
+            "pending": max(0, len(added) - SYNC_PROBE_LIMIT),
+            "accounts": [a.to_public() for a in pool.list()], "pool": pool.summary()}
+
+
+@router.post("/panel/api/accounts/{account_id}/probe")
+async def probe_one(account_id: str) -> Any:
     try:
-        value = await asyncio.to_thread(server.upstream.session.whoami)
+        return {"probe": await asyncio.to_thread(pool.probe, account_id),
+                "accounts": [a.to_public() for a in pool.list()]}
     except ApiError as exc:
-        value = {"ok": False, "status": exc.http_status, "detail": exc.message}
-    except Exception as exc:  # noqa: BLE001 网络层任何异常都不该把面板打挂
-        value = {"ok": False, "status": 0, "detail": f"{type(exc).__name__}: {exc}"}
-    _SESSION.update(at=now, value=value)
-    return value
+        return JSONResponse(status_code=exc.http_status, content=exc.to_body())
 
 
-def _cookie_info() -> dict[str, Any]:
-    """只读本地，不打上游：面板每 15 秒轮询一次，不能拿它当健康检查打。"""
-    info: dict[str, Any] = {"present": False, "count": 0, "updated_at": None, "source": None}
-    if os.getenv("HF_COOKIES_JSON", "").strip():
-        try:
-            info.update(present=True, count=len(load_cookies()), source="HF_COOKIES_JSON")
-        except ApiError:
-            info.update(present=True, source="HF_COOKIES_JSON", count=0)
-        return info
-    path = settings.cookie_path()
-    if path.exists():
-        try:
-            info.update(
-                present=True,
-                count=len(parse_cookies(path.read_text(encoding="utf-8", errors="replace"), source=str(path))),
-                updated_at=int(path.stat().st_mtime),
-                source=str(path),
-            )
-        except ApiError:
-            info.update(present=True, source=str(path), count=0)
-    return info
+@router.post("/panel/api/accounts/{account_id}/cookie")
+async def replace_account_cookie(account_id: str, request: HttpRequest) -> Any:
+    """换掉某号的 cookie（号过期最高频的修复动作），保留统计与任务归属。"""
+    raw = (await request.body())[:MAX_BODY].decode("utf-8", "replace").strip()
+    if not raw:
+        return _bad_request("内容为空")
+    segments = _split_segments(raw)
+    try:
+        cookies = _parse_one(segments[0])
+        acc = pool.replace_cookies(account_id, cookies)
+    except ApiError as exc:
+        return JSONResponse(status_code=exc.http_status, content=exc.to_body())
+
+    probe = await asyncio.to_thread(pool.probe, acc.id)
+    return {
+        "id": acc.id,
+        "missing": [k for k in ("__client", "__client_uat") if k not in cookies],
+        "probe": probe,
+        "accounts": [a.to_public() for a in pool.list()],
+    }
+
+
+@router.post("/panel/api/accounts/{account_id}/toggle")
+async def toggle_account(account_id: str, request: HttpRequest) -> Any:
+    raw = (await request.body())[:4096].decode("utf-8", "replace").strip()
+    try:
+        enabled = bool(json.loads(raw or "{}").get("enabled"))
+        pool.update(account_id, enabled=enabled)
+    except ApiError as exc:
+        return JSONResponse(status_code=exc.http_status, content=exc.to_body())
+    except Exception:
+        return _bad_request("请求体不是合法 JSON")
+    return {"accounts": [a.to_public() for a in pool.list()], "pool": pool.summary()}
+
+
+@router.post("/panel/api/accounts/{account_id}/rename")
+async def rename_account(account_id: str, request: HttpRequest) -> Any:
+    raw = (await request.body())[:4096].decode("utf-8", "replace").strip()
+    try:
+        name = str(json.loads(raw or "{}").get("name") or "")
+        pool.update(account_id, name=name)
+    except ApiError as exc:
+        return JSONResponse(status_code=exc.http_status, content=exc.to_body())
+    except Exception:
+        return _bad_request("请求体不是合法 JSON")
+    return {"accounts": [a.to_public() for a in pool.list()]}
+
+
+@router.delete("/panel/api/accounts/{account_id}")
+async def delete_account(account_id: str) -> Any:
+    if not pool.remove(account_id):
+        return JSONResponse(status_code=404, content={"error": {"code": "NotFound", "message": "账号不存在"}})
+    return {"accounts": [a.to_public() for a in pool.list()], "pool": pool.summary()}
+
+
+@router.post("/panel/api/reload")
+async def reload_pool() -> Any:
+    """从磁盘重读 data/accounts.json（手工改文件或多副本同步后用）。"""
+    loaded = await asyncio.to_thread(pool.reload)
+    return {**loaded, "accounts": [a.to_public() for a in pool.list()], "pool": pool.summary()}
 
 
 @router.get("/panel/api/state")
-async def state(force: int = 0) -> dict[str, Any]:
+async def state() -> dict[str, Any]:
     from . import server
 
     tasks = server.store.list(50)
-    if force:
-        _SESSION["value"] = None
     return {
         "server_time": int(time.time()),
         "flags": {
@@ -230,8 +330,8 @@ async def state(force: int = 0) -> dict[str, Any]:
             "max_batch": settings.max_batch,
             "expires_after": settings.execution_expires_after,
         },
-        "session": await _session_snapshot(),
-        "cookie": _cookie_info(),
+        "pool": pool.summary(),
+        "accounts": [a.to_public() for a in pool.list()],
         "tasks": tasks,
         "counts": {s: sum(1 for t in tasks if t.get("status") == s)
                    for s in ("queued", "running", "succeeded", "failed", "cancelled", "expired")},
@@ -264,46 +364,9 @@ async def dry_run(request: HttpRequest) -> Any:
 
 
 @router.post("/panel/api/cookie")
-async def upload_cookie(request: HttpRequest) -> Any:
-    """接受 Copy as cURL 文本 / 原始 cookie 头 / Cookie-Editor JSON，写盘并立即自检。"""
-    from . import server
-
-    raw = (await request.body())[:MAX_BODY].decode("utf-8", "replace").strip()
-    if not raw:
-        return JSONResponse(status_code=400, content={"error": {"code": CODE_INVALID, "message": "内容为空"}})
-
-    try:
-        cookies = cookies_from_curl(raw) if ("-H" in raw and "cookie:" in raw.lower()) else parse_cookies(raw, source="面板输入")
-    except ApiError as exc:
-        return JSONResponse(status_code=exc.http_status, content=exc.to_body())
-
-    path = settings.cookie_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
-    path.chmod(0o600)
-
-    server.upstream.session.set_cookies(cookies)
-    _SESSION["value"] = None
-    probe = await _session_snapshot(force=True)
-    return {
-        "written": str(path),
-        "count": len(cookies),
-        "missing": [k for k in ("__client", "__client_uat") if k not in cookies],
-        "session": probe,
-    }
-
-
-@router.post("/panel/api/reload")
-async def reload_cookie() -> Any:
-    from . import server
-
-    try:
-        server.upstream.session.reload_cookies()
-    except ApiError as exc:
-        _SESSION.update(at=0.0, value=None)
-        return JSONResponse(status_code=exc.http_status, content=exc.to_body())
-    _SESSION.update(at=0.0, value=None)
-    return {"reloaded": True, "session": await _session_snapshot(force=True)}
+async def upload_cookie_compat(request: HttpRequest) -> Any:
+    """老接口别名：等价于新增账号。保留是为了不打断已有的 curl 脚本。"""
+    return await add_accounts(request, name="")
 
 
 # --------------------------------------------------------------------------- 模板
@@ -354,277 +417,3 @@ button:hover{{background:#255ed4}}
 </form></body></html>"""
 
 
-DASHBOARD = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>higgsfield2api 面板</title><style>
-*{box-sizing:border-box}
-:root{--bg:#f5f6f8;--card:#fff;--line:#e3e6ea;--ink:#1c1f23;--muted:#6b7280;--accent:#2f6fed;
---ok:#0f8a4d;--okbg:#e8f6ee;--warn:#a8620a;--warnbg:#fdf3e3;--bad:#b42318;--badbg:#fdecec;--run:#1f6fb2;--runbg:#e8f2fb}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-header{display:flex;align-items:center;gap:14px;padding:14px 24px;background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}
-header h1{margin:0;font-size:15px;letter-spacing:.2px}
-header .sp{flex:1}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600}
-.pill.ok{background:var(--okbg);color:var(--ok)}.pill.warn{background:var(--warnbg);color:var(--warn)}
-.pill.bad{background:var(--badbg);color:var(--bad)}.pill.run{background:var(--runbg);color:var(--run)}
-.pill.off{background:#f0f1f3;color:var(--muted)}
-.ghost{border:1px solid var(--line);background:#fff;color:#374151;padding:6px 12px;border-radius:8px;font:inherit;font-size:12.5px;cursor:pointer}
-.ghost:hover{border-color:#c3c9d2;background:#fafbfc}
-main{max-width:1180px;margin:0 auto;padding:22px 24px 60px}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:18px}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.kpi .k{font-size:11.5px;color:var(--muted);letter-spacing:.3px;text-transform:uppercase}
-.kpi .v{font-size:19px;font-weight:650;margin-top:5px}
-.kpi .d{font-size:11.5px;color:var(--muted);margin-top:3px}
-section{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:16px;overflow:hidden}
-section > h2{margin:0;padding:13px 16px;font-size:13px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
-section > h2 .tag{font-weight:400;color:var(--muted);font-size:11.5px}
-.pad{padding:16px}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{text-align:left;padding:9px 16px;background:#fafbfc;color:var(--muted);font-weight:600;font-size:11.5px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:10px 16px;border-bottom:1px solid #f1f3f5;vertical-align:top}
-tr:last-child td{border-bottom:0}
-tr.row:hover td{background:#fafbfd}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px}
-.prompt{max-width:420px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;color:#374151}
-.empty{padding:26px 16px;text-align:center;color:var(--muted);font-size:12.5px}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media(max-width:900px){.cols{grid-template-columns:1fr}}
-label.f{display:block;font-size:11.5px;color:var(--muted);margin:0 0 5px}
-textarea,input.t{width:100%;border:1px solid #d6dae1;border-radius:8px;padding:9px 11px;font:inherit;font-size:12.5px;outline:none;background:#fff}
-textarea:focus,input.t:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(47,111,237,.1)}
-textarea{min-height:92px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.actions{display:flex;gap:8px;align-items:center;margin-top:10px}
-.btn{border:0;border-radius:8px;background:var(--accent);color:#fff;padding:8px 14px;font:600 13px/1 inherit;cursor:pointer}
-.btn:hover{background:#255ed4}.btn[disabled]{opacity:.6;cursor:default}
-pre.out{margin:12px 0 0;padding:12px;background:#0f1420;color:#d7e3f4;border-radius:8px;font-size:11.5px;line-height:1.55;
-overflow:auto;max-height:300px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
-.hint{font-size:11.5px;color:var(--muted);margin-top:8px}
-footer{max-width:1180px;margin:0 auto;padding:0 24px 40px;color:#9aa1ac;font-size:11.5px}
-code{background:#f2f4f7;padding:1px 5px;border-radius:4px;font-size:11.5px}
-</style></head><body>
-<header>
-  <span class="pill run" style="width:10px;height:10px;padding:0"></span>
-  <h1>higgsfield2api</h1>
-  <span id="hdrFlags" class="hint"></span>
-  <span class="sp"></span>
-  <span id="hdrSession" class="pill off">会话检查中…</span>
-  <button class="ghost" onclick="refresh(true)">刷新</button>
-  <form method="post" action="/panel/logout" style="margin:0"><button class="ghost" type="submit">退出</button></form>
-</header>
-<main>
-  <div class="kpis">
-    <div class="kpi"><div class="k">计费</div><div class="v" id="kBilling">—</div><div class="d" id="kBillingSub"></div></div>
-    <div class="kpi"><div class="k">上游会话</div><div class="v" id="kSession">—</div><div class="d" id="kSessionSub"></div></div>
-    <div class="kpi"><div class="k">本地台账</div><div class="v" id="kTasks">—</div><div class="d" id="kTasksSub"></div></div>
-    <div class="kpi"><div class="k">护栏</div><div class="v" id="kGuard">—</div><div class="d" id="kGuardSub"></div></div>
-  </div>
-
-  <section>
-    <h2>任务台账 <span class="tag" id="taskTag">最近 50 条</span></h2>
-    <div id="taskWrap"><div class="empty">加载中…</div></div>
-  </section>
-
-  <div class="cols">
-    <section>
-      <h2>报文干跑 <span class="tag">零计费</span></h2>
-      <div class="pad">
-        <label class="f" for="prompt">prompt</label>
-        <textarea id="prompt" placeholder="一只橘猫在雨天的霓虹街头慢跑">一只橘猫在雨天的霓虹街头慢跑</textarea>
-        <div class="grid2" style="margin-top:10px">
-          <div><label class="f" for="dur">duration（4–30）</label><input class="t" id="dur" type="number" value="4" min="4" max="30"></div>
-          <div><label class="f" for="ratio">ratio</label>
-            <select class="t" id="ratio">
-              <option>auto</option><option>16:9</option><option>9:16</option><option>1:1</option>
-              <option>4:3</option><option>3:4</option><option>21:9</option>
-            </select></div>
-        </div>
-        <div class="actions"><button class="btn" id="dryBtn">翻译并校验</button>
-          <span class="hint">只走本地纯函数，不碰上游</span></div>
-        <pre class="out" id="dryOut" hidden></pre>
-      </div>
-    </section>
-
-    <section>
-      <h2>上游会话 <span class="tag">cookie</span></h2>
-      <div class="pad">
-        <p class="hint" style="margin-top:0" id="cookieInfo">读取中…</p>
-        <label class="f" for="curl">粘贴 DevTools「Copy as cURL」（必须含 <code>-H 'cookie: …'</code>）</label>
-        <textarea id="curl" placeholder="curl 'https://fnf-api-gw.higgsfield.ai/fnf/jobs?size=1' -H 'cookie: __client=...; __client_uat=...' ..."></textarea>
-        <div class="actions">
-          <button class="btn" id="ckBtn">导入并自检</button>
-          <button class="btn" id="rlBtn" style="background:#4b5563">重载已有 cookie</button>
-        </div>
-        <pre class="out" id="ckOut" hidden></pre>
-      </div>
-    </section>
-  </div>
-
-  <section>
-    <h2>只读配置 <span class="tag">改 .env 后 docker compose up -d 生效</span></h2>
-    <div class="pad mono" id="cfg" style="line-height:1.9">读取中…</div>
-  </section>
-</main>
-<footer>计费开关不在面板里做：<code>ALLOW_BILLING</code> 只能改 .env 并重启，避免误点一下就花钱。</footer>
-<script>
-const $ = s => document.querySelector(s);
-
-async function api(path, opts = {}) {
-  const r = await fetch(path, {credentials: 'same-origin', ...opts});
-  if (r.status === 401) { location.href = '/panel/login'; throw new Error('未登录'); }
-  const txt = await r.text();
-  let data; try { data = JSON.parse(txt); } catch { data = {raw: txt}; }
-  if (!r.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + r.status));
-  return data;
-}
-
-function pill(text, cls) {
-  const s = document.createElement('span');
-  s.className = 'pill ' + cls; s.textContent = text; return s;
-}
-
-const ST = {queued:['排队','run'], running:['生成中','run'], succeeded:['成功','ok'],
-            failed:['失败','bad'], cancelled:['已取消','off'], expired:['过期','warn']};
-
-function renderTasks(tasks) {
-  const wrap = $('#taskWrap');
-  if (!tasks.length) { wrap.innerHTML = '<div class="empty">还没有任务。先在上游会话里导入 cookie，再到干跑区核对报文。</div>'; return; }
-  const t = document.createElement('table');
-  const thead = document.createElement('thead');
-  thead.innerHTML = '<tr><th>创建时间</th><th>ID</th><th>状态</th><th>时长/比例</th><th>prompt</th><th>产物</th></tr>';
-  t.appendChild(thead);
-  const tb = document.createElement('tbody');
-  for (const x of tasks) {
-    const tr = document.createElement('tr'); tr.className = 'row';
-    const created = new Date((x.created_at || 0) * 1000);
-    const when = document.createElement('td');
-    when.className = 'mono';
-    when.textContent = created.toLocaleString('zh-CN', {hour12: false});
-    const id = document.createElement('td');
-    id.className = 'mono'; id.textContent = (x.id || '').slice(0, 14) + ((x.id || '').length > 14 ? '…' : '');
-    const status = document.createElement('td');
-    const [label, cls] = ST[x.status] || [x.status || '—', 'off'];
-    status.appendChild(pill(label, cls));
-    if (x.error && x.error.message) {
-      const e = document.createElement('div');
-      e.className = 'hint'; e.style.marginTop = '4px';
-      e.textContent = String(x.error.message).slice(0, 90);
-      status.appendChild(e);
-    }
-    const meta = document.createElement('td');
-    meta.className = 'mono';
-    meta.textContent = (x.duration || '—') + 's / ' + (x.ratio || '—') + ' / ' + (x.resolution || '—');
-    const pr = document.createElement('td');
-    const p = document.createElement('div'); p.className = 'prompt';
-    p.textContent = x.prompt || (x.content && x.content.length ? '' : '（无 prompt 记录）');
-    pr.appendChild(p);
-    const out = document.createElement('td');
-    const url = x.content && x.content.video_url;
-    if (url && /^https?:\/\//i.test(url)) {
-      const a = document.createElement('a');
-      a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-      a.textContent = '视频 ↗'; a.style.fontSize = '12px';
-      out.appendChild(a);
-    } else if (x.id) {
-      const b = document.createElement('button');
-      b.className = 'ghost'; b.textContent = '刷新状态'; b.style.padding = '3px 9px';
-      b.onclick = async () => {
-        b.disabled = true; b.textContent = '刷新中…';
-        try { const d = await api('/panel/api/task/' + encodeURIComponent(x.id)); }
-        catch (e) { b.textContent = '失败'; }
-        finally { setTimeout(() => { b.disabled = false; b.textContent = '刷新状态'; refresh(false); }, 600); }
-      };
-      out.appendChild(b);
-    } else { out.textContent = '—'; }
-    tr.append(when, id, status, meta, pr, out);
-    tb.appendChild(tr);
-  }
-  t.appendChild(tb);
-  wrap.replaceChildren(t);
-}
-
-function setPill(el, session) {
-  el.className = 'pill ' + (session.ok ? 'ok' : (session.status === 401 ? 'bad' : 'warn'));
-  el.textContent = session.ok ? '会话可用' : ('会话异常 ' + (session.status || ''));
-  el.title = session.detail || '';
-}
-
-async function refresh(force) {
-  try {
-    const s = await api('/panel/api/state' + (force ? '?force=1' : ''));
-    const f = s.flags;
-    $('#kBilling').textContent = f.billing ? '已开启' : '关闭';
-    $('#kBilling').style.color = f.billing ? 'var(--warn)' : 'var(--ok)';
-    $('#kBillingSub').textContent = f.billing ? '建任务会真实消耗额度' : '建任务返回 403，只翻译不花钱';
-    $('#kSession').textContent = s.session.ok ? '正常' : '待导入';
-    $('#kSession').style.color = s.session.ok ? 'var(--ok)' : 'var(--bad)';
-    $('#kSessionSub').textContent = s.cookie.present ? ('cookie ' + s.cookie.count + ' 项') : '无 cookie 文件';
-    $('#kTasks').textContent = s.tasks.length;
-    const c = s.counts;
-    $('#kTasksSub').textContent = '成功 ' + c.succeeded + ' · 失败 ' + c.failed + ' · 进行中 ' + (c.queued + c.running);
-    $('#kGuard').textContent = '≤' + f.max_duration + 's / ≤' + f.max_batch + ' 条';
-    $('#kGuardSub').textContent = (f.auth ? 'API 鉴权已开' : '⚠ API 无鉴权') + ' · 免费额度优先 ' + (f.use_free_gens ? '是' : '否');
-    $('#hdrFlags').textContent = f.billing ? '计费已开' : '计费关闭';
-    setPill($('#hdrSession'), s.session);
-
-    const ci = s.cookie;
-    $('#cookieInfo').textContent = ci.present
-      ? ('当前 cookie：' + ci.count + ' 项，来源 ' + ci.source + (ci.updated_at ? '，更新于 ' + new Date(ci.updated_at * 1000).toLocaleString('zh-CN', {hour12: false}) : ''))
-      : '当前没有 cookie 文件 —— 建任务会 401，需要先导入';
-
-    renderTasks(s.tasks);
-    $('#cfg').textContent = '';
-    const rows = {
-      'SERVICE_TOKEN': f.auth ? '已设置（面板与 API 共用同一口令）' : '未设置（危险：API 无鉴权）',
-      'ALLOW_BILLING': String(f.billing),
-      'MAX_DURATION': f.max_duration + ' 秒',
-      'MAX_BATCH': String(f.max_batch),
-      'USE_FREE_GENS': String(f.use_free_gens),
-      'EXECUTION_EXPIRES_AFTER': f.expires_after + ' 秒',
-      '服务器时间': new Date(s.server_time * 1000).toLocaleString('zh-CN', {hour12: false})
-    };
-    for (const [k, v] of Object.entries(rows)) {
-      const d = document.createElement('div');
-      d.textContent = k + ' = ' + v;
-      $('#cfg').appendChild(d);
-    }
-  } catch (e) {
-    console.error(e);
-  }
-}
-
-$('#dryBtn').onclick = async () => {
-  const out = $('#dryOut'); out.hidden = false; out.textContent = '计算中…';
-  const body = {
-    model: 'magi_2',
-    content: [{type: 'text', text: $('#prompt').value || 'x'}],
-    duration: Number($('#dur').value || 4),
-    ratio: $('#ratio').value
-  };
-  try { out.textContent = JSON.stringify(await api('/panel/api/dry-run', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}), null, 2); }
-  catch (e) { out.textContent = '错误：' + e.message; }
-};
-
-$('#ckBtn').onclick = async () => {
-  const out = $('#ckOut'); out.hidden = false;
-  const txt = $('#curl').value.trim();
-  if (!txt) { out.textContent = '先粘贴 Copy as cURL 的内容'; return; }
-  out.textContent = '导入并自检中…';
-  try {
-    const r = await api('/panel/api/cookie', {method: 'POST', headers: {'Content-Type': 'text/plain'}, body: txt});
-    out.textContent = JSON.stringify(r, null, 2);
-    refresh(true);
-  } catch (e) { out.textContent = '错误：' + e.message; }
-};
-
-$('#rlBtn').onclick = async () => {
-  const out = $('#ckOut'); out.hidden = false; out.textContent = '重载中…';
-  try { out.textContent = JSON.stringify(await api('/panel/api/reload', {method: 'POST'}), null, 2); refresh(true); }
-  catch (e) { out.textContent = '错误：' + e.message; }
-};
-
-refresh(true);
-setInterval(() => refresh(false), 15000);
-</script></body></html>"""

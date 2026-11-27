@@ -49,6 +49,16 @@ class Settings:
 
     # ---- 凭据（只放路径） ----
     cookies_file: Path = _path("HF_COOKIES_FILE", BASE_DIR / "secrets" / "cookies.json")
+    accounts_file: Path = _path("ACCOUNTS_FILE", BASE_DIR / "data" / "accounts.json")
+
+    # ---- 号池调度 ----
+    pool_retry: int = _int("POOL_RETRY", 2)                    # 建任务最多试几个号
+    pool_auth_strikes: int = _int("POOL_AUTH_STRIKES", 2)       # 连续几次 401 判死
+    pool_auth_cooldown: int = _int("POOL_AUTH_COOLDOWN", 120)   # 单次 401 冷却秒
+    pool_rate_cooldown: int = _int("POOL_RATE_COOLDOWN", 90)    # 429 冷却秒
+    pool_base_cooldown: int = _int("POOL_BASE_COOLDOWN", 30)    # 其它失败退避基数
+    pool_max_cooldown: int = _int("POOL_MAX_COOLDOWN", 600)     # 退避上限
+    probe_timeout: int = _int("PROBE_TIMEOUT", 12)              # 单号自检超时
 
     # ---- 计费红线 ----
     allow_billing: bool = _bool("ALLOW_BILLING", False)

@@ -115,10 +115,14 @@ def _jwt_exp(jwt: str) -> int:
 
 
 class Session:
-    """一个进程内复用的上游会话。cookie 只读，JWT 按需刷新。"""
+    """一个账号的上游会话。cookie 只读，JWT 按需刷新。
 
-    def __init__(self) -> None:
-        self._cookies: dict[str, str] | None = None
+    号池里每个账号各持一个实例：JWT 缓存互不干扰，一个号刷 token 不会把别的号顶掉。
+    `Session({})` 表示匿名会话（查询用，只读端点本来就匿名可读）。
+    """
+
+    def __init__(self, cookies: dict[str, str] | None = None) -> None:
+        self._cookies: dict[str, str] | None = None if cookies is None else dict(cookies)
         self._jwt: str = ""
         self._jwt_exp: int = 0
         self.client = cffi.Session(impersonate=settings.impersonate)
@@ -150,19 +154,21 @@ class Session:
         }
         # 查询 /jobs/{id} 上游不校验 JWT，没有 cookie 也应当能查；只有创建才需要
         try:
-            h["Cookie"] = cookie_header(self.cookies)
+            ck = self.cookies
+            if ck:
+                h["Cookie"] = cookie_header(ck)
         except ApiError:
             pass
         h.update({str(k): str(v) for k, v in settings.extra_headers.items()})
         return h
 
-    def auth_headers(self) -> dict[str, str]:
+    def auth_headers(self, timeout: int | None = None) -> dict[str, str]:
         h = self.base_headers()
-        h["Authorization"] = f"Bearer {self.jwt()}"
+        h["Authorization"] = f"Bearer {self.jwt(timeout=timeout)}"
         return h
 
     # -- token
-    def jwt(self, force: bool = False) -> str:
+    def jwt(self, force: bool = False, timeout: int | None = None) -> str:
         now = int(time.time())
         if not force and self._jwt and self._jwt_exp - 15 > now:
             return self._jwt
@@ -178,7 +184,7 @@ class Session:
                     "Origin": settings.site,
                     "Referer": f"{settings.site}/",
                 },
-                timeout=30,
+                timeout=timeout or 30,
             )
         except ApiError:
             raise
@@ -217,16 +223,19 @@ class Session:
     # -- 便捷请求
     def request(self, method: str, url: str, *, json_body: Any = None, authed: bool = True,
                 timeout: int | None = None) -> cffi.Response:
-        headers = self.auth_headers() if authed else self.base_headers()
+        headers = self.auth_headers(timeout=timeout) if authed else self.base_headers()
         return self.client.request(
             method, url, json=json_body, headers=headers,
             timeout=timeout or settings.request_timeout,
         )
 
     # -- 零计费自检
-    def whoami(self) -> dict[str, Any]:
-        """用一次只读请求确认 cookie/JWT 是否可用：GET /jobs?size=1。不产生任何任务。"""
-        r = self.request("GET", f"{settings.gateway}/jobs?size=1")
+    def whoami(self, timeout: int | None = None) -> dict[str, Any]:
+        """用一次只读请求确认 cookie/JWT 是否可用：GET /jobs?size=1。不产生任何任务。
+
+        自检会传一个短超时：一个连不通的号不该让整批导入卡住 30 秒。
+        """
+        r = self.request("GET", f"{settings.gateway}/jobs?size=1", timeout=timeout)
         ok = r.status_code == 200
         return {
             "ok": ok,

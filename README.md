@@ -3,6 +3,9 @@
 把 `higgsfield.ai/ai/video?model=magi_2` 的网页调用收敛成一个异步任务 API。**默认零消耗**：不开
 `ALLOW_BILLING` 时它只翻译、校验、打印真实上游报文，一次额度都不花。
 
+支持**多账号号池**：粘贴 N 份 Copy-as-cURL 就能把 N 个号的免费额度接进来，按「最少在飞 + 最久未用」
+轮询，401/429/Cloudflare 拦截自动换号重试，失效号自动熔断并在面板上标红。
+
 > 服务器部署（Docker 镜像 / 反代 / 证书 / 升级回滚 / 排障表）：见 **[DEPLOY.md](./DEPLOY.md)**。
 
 ---
@@ -15,6 +18,7 @@
 | 网页用的是什么接口？ | `POST https://fnf-api-gw.higgsfield.ai/fnf/jobs/v2/magi_2`，`{params:{...}}` 信封 |
 | 能不能纯服务端跑？ | **能**，但必须先过两道门：Cloudflare 指纹 + Clerk 会话。两者都能用 cookie 复用，不需要常驻浏览器 |
 | 唯一会花钱的动作 | `POST /jobs/v2/magi_2`。查询 `GET /jobs/{id}` **匿名可读**（实测返回 404 而非 401） |
+| 号池怎么保证不重复计费 | 只在「上游明确没受理」时换号重试（401 / 429 / CF 403）；网络异常与 5xx 一律不重发，因为 `{id}` 是唯一幂等键 |
 
 ---
 
@@ -113,11 +117,32 @@ curl -s https://<host>/admin/session -H "Authorization: Bearer $SERVICE_TOKEN"
 | 端点 | 计费 | 用途 |
 |---|---|---|
 | `GET /healthz` | — | 存活 + 护栏快照（`auth_required` / `billing_enabled` / `max_batch`） |
-| `GET /admin/session` | 0 | 只打 `GET /jobs?size=1`，确认 cookie / JWT 还能用 |
+| `GET /admin/session` | 0 | 号池概览 + 逐号 `GET /jobs?size=1` 自检（`?probe=0` 只看状态） |
+| `GET /admin/accounts` | 0 | 号池状态快照，不探测上游，秒回 |
 | `POST /admin/dry-run` | 0 | 等价于 `X-Dry-Run: 1`：翻译 + 校验，打印真实上游报文 |
-| `POST /admin/reload` | 0 | 重载 cookie（文件或 `HF_COOKIES_JSON`），不必重启容器 |
+| `POST /admin/reload` | 0 | 从 `data/accounts.json` 重读号池，不必重启容器 |
 
 `SERVICE_TOKEN` 为空时不做鉴权 —— **该模式只能绑回环地址**，否则任何人都能拿你的额度建任务。
+
+### 号池（多账号）
+
+号池存在 `data/accounts.json`（0600，含 cookie 明文，**不要入 git、不要外发**）。一个账号 = 一份浏览器
+cookie + 独立的 JWT 缓存 + 独立的 curl_cffi 客户端，号与号之间完全隔离。
+
+| 机制 | 行为 | 为什么这么定 |
+|---|---|---|
+| 选号 | 可用号里取 `(在飞数, 最后使用时间)` 最小者 | 等价于加权轮询，但短任务不会让某个号被反复砸中 |
+| 换号重试 | 仅 401 / 429 / Cloudflare 403，最多 `POOL_RETRY`（默认 2）个号 | 这三种是「上游明确没受理」，重发不会多扣一次额度 |
+| **不重试** | 网络异常、5xx、超时 | 请求可能已到达上游，重发就是第二个计费任务 |
+| 熔断 | 连续 `POOL_AUTH_STRIKES`（默认 2）次 401 判死；429 冷却 90s；其它指数退避 | 单次 401 可能只是 Clerk 抖动，一次就判死会误杀好号 |
+| 恢复 | 冷却到期自动半开；换 cookie 或点「启用」立刻清零 | 不需要重启，也不需要删号重建 |
+| 任务归属 | 建任务时把 `account_id` 写进台账，查询优先用同一个号 | 换号查别人的任务虽然上游也认，但归因会乱 |
+
+号池为空时建任务返回 `503 NoAvailableAccount`，错误信息里带「几个停用 / 几个失效 / 几个冷却」，
+不会含糊地说一句「服务不可用」。
+
+账号数量没有硬上限，但**别把几十个号同时挂上去**：上游风控看的是 IP + 指纹维度，
+同一个出口 IP 上高并发多号，比单号跑更容易整段被封。
 
 ### 运维面板 `/panel`
 
@@ -125,10 +150,11 @@ curl -s https://<host>/admin/session -H "Authorization: Bearer $SERVICE_TOKEN"
 
 | 能力 | 说明 |
 |---|---|
-| 总览 | 计费开关、上游会话、台账计数、护栏值 —— 全部只读 |
-| 任务台账 | 最近 50 条：状态 / 时长 / 比例 / prompt / 产物链接，可单条回源刷新 |
+| 号池 | 每个号的状态 / 成功失败计数 / 最后成功时间；单号自检、换 cookie、停用、删除 |
+| 批量导入 | 一次粘贴多段 Copy as cURL（按行首 `curl` 自动切分），导入后逐个自检 |
+| 总览 | 计费开关、号池可用数、台账计数、护栏值 —— 全部只读 |
+| 任务台账 | 最近 50 条：状态 / 归因到哪个号 / 时长 / 比例 / prompt / 产物链接，可单条回源刷新 |
 | 报文干跑 | 表单直接产出真实上游报文，零计费 |
-| cookie 导入 | 粘贴 DevTools 的「Copy as cURL」→ 写盘 → 立即自检，不必登服务器 |
 | 刻意不做 | **开计费开关**。`ALLOW_BILLING` 只能改 `.env` 重启，让"花钱"不会是一次误点 |
 
 面板会话是 `HttpOnly + SameSite=Strict` 的签名 cookie（HMAC 密钥即口令，改口令即全端下线），

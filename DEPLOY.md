@@ -12,9 +12,10 @@
 | 仓库 / 镜像 | `ghcr.io/rsfree/higgsfield2api`（private，节点需已 `docker login ghcr.io`） |
 | 部署目录 | `/opt/higgsfield2api` |
 | 监听端口 | `127.0.0.1:39420` → 容器 `8000` |
-| 数据卷 | `higgsfield2api_hfdata`（sqlite 台账）、`higgsfield2api_hfsecrets`（cookies.json） |
+| 数据卷 | `higgsfield2api_hfdata`（**号池 `accounts.json`** + sqlite 台账）、`higgsfield2api_hfsecrets`（遗留 cookies.json） |
 | 公网入口 | `https://higgsfield2api.1task.cn`（nginx 反代 + acme.sh 证书） |
 | 鉴权 | `SERVICE_TOKEN` 必填，`Authorization: Bearer <token>` |
+| 号池 | 多账号轮询；账号存 `/app/data/accounts.json`（0600），面板里增删改查 |
 | 面板 | `https://higgsfield2api.1task.cn/panel`，口令 = `PANEL_PASSWORD`（空则复用 `SERVICE_TOKEN`） |
 | 计费开关 | `ALLOW_BILLING=0`（默认关；开=真花钱，见 §7） |
 
@@ -81,6 +82,10 @@ HF_CLERK_PROXY=https://higgsfield.ai/_clerk
 HF_IMPERSONATE=chrome
 HF_EXTRA_HEADERS={"hf-surface":"web"}
 
+# 号池。账号推荐在面板里导入，不必手工改这个文件
+ACCOUNTS_FILE=/app/data/accounts.json
+PROBE_TIMEOUT=12
+
 ALLOW_BILLING=0
 USE_FREE_GENS=1
 MAX_DURATION=5
@@ -98,40 +103,50 @@ chmod 600 .env
 
 ---
 
-## 5. 导入会话 cookie（必需）
+## 5. 导入账号（号池）
 
-服务没有 cookie 时 `/healthz` 正常，但 `/admin/session` 与建任务都会 401 —— 这是“活着但没钥匙”，不是故障。
+号池为空时 `/healthz` 仍然 200，但建任务会返回 `503 NoAvailableAccount` —— 这是“活着但没钥匙”，不是故障。
 
-**推荐路径：面板导入**（不必登服务器）
+**推荐路径：面板**（不必登服务器）
 
 1. 浏览器登录 `higgsfield.ai` → DevTools → Network → 任意 XHR → 右键 **Copy as cURL**；
-2. 打开 `https://<域名>/panel` → 「上游会话」→ 粘贴 → **导入并自检**；
-3. 看返回：`session.ok=true` 即通；`missing` 里若出现 `__client`，说明贴的是 `document.cookie`（拿不到 HttpOnly）。
+   （每个号用独立 profile 或隐身窗口，别让 cookie 互相覆盖）
+2. 打开 `https://<域名>/panel` → 号池 → 粘贴 → **导入并自检**；
+3. 看到 `✓` 即通。`missing` 里若出现 `__client`，说明贴的是 `document.cookie`（拿不到 HttpOnly）。
+
+多个号可以**一次性粘贴多段 cURL**（每段以 `curl` 开头），按行首自动切分批量导入。
+批量导入只同步自检前 3 个，其余标「未验证」，点右上「全部自检」再跑一遍（4 路并发）。
 
 **命令行等价路径**（脚本化 / 无浏览器时）
 
 ```bash
 cd /opt/higgsfield2api
-docker compose up -d
 
-# 本机浏览器登录 higgsfield.ai → DevTools → Network → 任意 XHR → 右键 Copy as cURL
-# 存成 req.txt 后上传到服务器，然后：
+# 单个号
 docker compose exec -T higgsfield2api \
-  python -m tools.cookie_import --curl /dev/stdin < req.txt
+  python -m tools.cookie_import --curl - --name "免费额度A" < req.txt
+
+# 多个号：req-batch.txt 里连着贴 N 段 cURL
+docker compose exec -T higgsfield2api \
+  python -m tools.cookie_import --curl - --name "号" < req-batch.txt
+
+# 只看号池状态
+curl -s localhost:39420/admin/accounts -H "Authorization: Bearer $TOKEN" | python -m json.tool
 ```
 
-该命令会写 `/app/secrets/cookies.json`（具名卷内）并顺手跑一次零计费的 `GET /jobs?size=1` 自检：
+输出 `"ok": true` 即通。常见失败：
 
-- 输出 `"ok": true` → 会话可用；
-- 输出 `缺少 ['__client']` → 你导的是 `document.cookie`，HttpOnly 拿不到，必须用 Copy as cURL；
-- 输出 `Clerk 返回 401/403` → cookie 过期或被 Cloudflare 拦，重登再导。
+| 输出 | 原因 |
+|---|---|
+| `缺少 ['__client']` | 导的是 `document.cookie`，HttpOnly 拿不到，必须 Copy as cURL |
+| `Clerk 返回 401/403` | cookie 过期或被 Cloudflare 拦，重登再导 |
+| `Clerk 刷新 JWT 失败（网络）` | 节点出站不通，或 `PROBE_TIMEOUT` 太小（默认 12s） |
 
-重导后**不必重启**：
+**换 cookie / 删号**：面板里点「换 cookie」贴新的即可，账号 id、统计、历史任务归属都保留；
+失效号会标红并自动停止被调度，不需要重启容器。
 
-```bash
-docker compose exec -i higgsfield2api sh -c 'cat > /app/secrets/cookies.json' < cookies.json
-curl -s -X POST localhost:39420/admin/reload -H "Authorization: Bearer $TOKEN"
-```
+**从单账号升级**：老部署的 `secrets/cookies.json` 会在号池为空时被自动收编成 `acc-default`，
+不需要任何手工迁移。
 
 ---
 
@@ -265,7 +280,11 @@ sed -i 's/^TAG=.*/TAG=sha-<旧sha7>/' .env && docker compose up -d
 | 建任务 401 `AuthenticationError` | 缺/错 token | 客户端补 `Authorization: Bearer` |
 | 建任务 403 `Forbidden.BillingDisabled` | 计费没开 | 见 §7。**这是保护，不是 bug** |
 | 建任务 503 `NoAvailableService` + HTML | Cloudflare 拦 | 见 §1；换 `HF_IMPERSONATE` 或换出口 IP |
-| `/admin/session` 401 `Clerk 返回 401` | cookie 过期 | 重导 cookie（§5），再 `/admin/reload` |
+| 建任务 503 `NoAvailableAccount` | 号池空 / 全部失效 / 全部冷却 | 错误信息里带「停用/失效/冷却」各几个；面板里看红行，换 cookie 或等冷却 |
+| `/admin/session` 401 `Clerk 返回 401` | cookie 过期 | 面板「换 cookie」（§5），不必重启 |
+| 面板里某号一直「失效」 | 连续 2 次上游 401 被判死 | 重登该号 → Copy as cURL → 「换 cookie」；换完自动复活 |
+| 建任务 502 `不要自动重试` | 网络异常，上游可能已受理 | **不要重发**。用 `/tasks` 核对台账，别为了确认多烧一次额度 |
+| 号池里 N 个号但 `usable` 一直是 0 | 全在同一出口 IP 上被风控 | 见 §1；减少并发号数，或分散出口 |
 | 建任务 400 `上游拒绝参数` | 前端发版改了字段 | 看 `error.upstream.body`，改 `hfapi/convert.py: build_params` |
 | 任务一直 `running` | 上游真慢 / 上游 404 | `curl 上游 /jobs/<id>`；超过 `EXECUTION_EXPIRES_AFTER` 会判 `expired` |
 | 502 且日志 `curl: (35)` | 出站 TLS 被拦 | 检查节点出口策略；必要时给容器加 `HTTPS_PROXY` |
@@ -282,5 +301,6 @@ sed -i 's/^TAG=.*/TAG=sha-<旧sha7>/' .env && docker compose up -d
 - [x] `ALLOW_BILLING` 与 `MAX_BATCH` / `MAX_DURATION` 三件套按需收紧
 - [x] `.env`、`secrets/` 权限 `600`，不进 git、不进镜像
 - [x] 不带 token 的请求返回 401（§6 第 2 条）
-- [ ] cookie 属于个人账号：泄露等同账号密码，轮换时同步 `/admin/reload`
+- [ ] `data/accounts.json` 含全部 cookie 明文：**等同账号密码集合**。备份、日志、截图都要按密钥处理，别贴进聊天工具
+- [ ] 号池里的号属于个人账号：泄露等同账号密码，轮换时用面板「换 cookie」
 - [ ] 高频调用会触发上游风控甚至封号 —— `MAX_BATCH=1` + 手动触发是当前唯一安全用法
