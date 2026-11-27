@@ -29,7 +29,7 @@ from .convert import build_params, parse_request, preview
 from .errors import CODE_AUTH, CODE_INVALID, ApiError
 from .pool import pool
 from .panel_html import DASHBOARD
-from .session import cookies_from_curl, parse_cookies
+from .session import cookies_from_curl, looks_like_curl, parse_cookies, require_session_cookies
 
 COOKIE = "hfpanel"
 TTL = 7 * 86400
@@ -185,9 +185,12 @@ def _split_segments(text: str) -> list[str]:
 
 
 def _parse_one(segment: str) -> dict[str, str]:
-    if re.search(r"-H\s+['\"]cookie:", segment, re.I) or re.search(r"(?:^|\s)(?:-b|--cookie)\s+['\"]", segment):
-        return cookies_from_curl(segment)
-    return parse_cookies(segment, source="面板输入")
+    """面板输入 → cookie 字典。curl 一律走 cookie 头解析，绝不回落到裸串解析。"""
+    if looks_like_curl(segment) or re.search(r"(?:^|\s)(?:-b|--cookie)\s+['\"]", segment):
+        cookies = cookies_from_curl(segment)
+    else:
+        cookies = parse_cookies(segment, source="面板输入")
+    return require_session_cookies(cookies, source="面板输入")
 
 
 def _bad_request(msg: str) -> JSONResponse:

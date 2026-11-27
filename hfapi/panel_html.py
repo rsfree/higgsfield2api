@@ -128,11 +128,13 @@ code{background:#f2f4f7;padding:1px 5px;border-radius:4px;font-size:11.5px}
       <div class="pad">
         <ol class="steps">
           <li>浏览器登录 <code>higgsfield.ai</code>（每个号用独立浏览器 profile 或隐身窗口，避免 cookie 互相覆盖）。</li>
-          <li>F12 → Network → 点任意一条发往 <code>fnf-api-gw</code> 的 XHR → 右键 <b>Copy as cURL</b>。</li>
+          <li>F12 → Network → 筛 <code>_clerk</code> → 点 <code>v1/client</code> 那条请求 → 右键 <b>Copy as cURL</b>。<br>
+              <span class="hint">别从 <code>fnf-api-gw</code> 的请求上复制：那上面只有 <code>Bearer</code> JWT（60 秒就过期），没有 <code>__client</code>。</span></li>
           <li>粘贴到上方「新增账号」→ 导入并自检。返回 <code>✓</code> 即可用。</li>
           <li>多个号：重复 2–3，或一次性粘贴多段 cURL（每段以 <code>curl</code> 开头），批量导入。</li>
         </ol>
         <p class="hint">浏览器里的 <code>document.cookie</code> 拿不到 <code>__client</code>（HttpOnly），粘那个一定失败。</p>
+        <p class="hint">实在找不到 <code>_clerk</code> 请求：F12 → Application → Cookies → <code>https://higgsfield.ai</code> → 复制 <code>__client</code> 的值，按 <code>__client=…</code> 形式粘贴（DevTools 能看到 HttpOnly cookie）。</p>
         <p class="hint">号被判定失效时不用删：点「换 cookie」贴新的，统计与历史任务归属都保留。</p>
       </div>
     </section>

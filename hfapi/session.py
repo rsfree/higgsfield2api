@@ -69,17 +69,51 @@ def parse_cookies(raw: str, *, source: str = "cookie") -> dict[str, str]:
     return out
 
 
+SESSION_COOKIE = "__client"
+
+_CURL_HOWTO = (
+    "正确姿势：浏览器登录 higgsfield.ai → F12 → Network → 筛 `_clerk` → "
+    "点任意一条（如 `v1/client`）→ 右键 Copy as cURL。"
+    "发往 fnf-api-gw 的请求只带 Bearer JWT，通常**不带** cookie，从那上面复制是拿不到号的。"
+)
+
+
+def looks_like_curl(text: str) -> bool:
+    """判断一段文本是不是 curl 命令（而不是裸 cookie 串）。
+
+    用来堵一个坑：没有 cookie 头的 curl 若走 `parse_cookies` 的兜底分支，
+    `sec-ch-ua: "Not-A.Brand";v="99"` 会被解析成 `{v: '"99"', q: '0.9'}` 这种垃圾，
+    然后静默入池变成一条永远 401 的死号。
+    """
+    return bool(re.search(r"^\s*curl\b", text, re.I | re.M)) or bool(re.search(r"-H\s+['\"]", text))
+
+
 def cookies_from_curl(text: str) -> dict[str, str]:
     """从 DevTools「Copy as cURL」里抠 cookie 头——只有这条路能拿到 HttpOnly 的 __client。"""
     m = re.search(r"-H\s+'cookie:\s*([^']+)'", text, re.I) or re.search(r'-H\s+"cookie:\s*([^"]+)"', text, re.I)
     if not m:
-        raise ApiError(
-            CODE_AUTH,
-            "这段文本里没有 `-H 'cookie: …'`。请在登录态下对任意 XHR 请求右键 Copy as cURL",
-            400,
-            param="curl",
-        )
+        if re.search(r"authorization:\s*['\"]?\s*bearer\s+eyJ", text, re.I):
+            raise ApiError(
+                CODE_AUTH,
+                "这段是 Bearer JWT，不是 cookie：JWT 寿命只有 60 秒，换新必须靠 __client。" + _CURL_HOWTO,
+                400,
+                param="curl",
+            )
+        raise ApiError(CODE_AUTH, "这段文本里没有 `-H 'cookie: …'`。" + _CURL_HOWTO, 400, param="curl")
     return parse_cookies(m.group(1).replace("\n", " "), source="curl cookie 头")
+
+
+def require_session_cookies(cookies: dict[str, str], *, source: str = "cookie") -> dict[str, str]:
+    """号池只收能换 JWT 的 cookie：缺 __client 的进去也是死号，不如在入口就拒掉。"""
+    if SESSION_COOKIE in cookies:
+        return cookies
+    raise ApiError(
+        CODE_AUTH,
+        f"{source} 里没有 __client（HttpOnly，只有 Copy as cURL 能拿到）。"
+        f"这份凭据换不到 JWT，入池后必然 401。当前解析到 {len(cookies)} 项：{', '.join(list(cookies)[:6]) or '空'}。" + _CURL_HOWTO,
+        400,
+        param="cookie",
+    )
 
 
 def load_cookies(path: Path | None = None) -> dict[str, str]:

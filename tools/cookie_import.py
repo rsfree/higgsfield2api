@@ -34,10 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hfapi.config import settings  # noqa: E402
 from hfapi.pool import pool  # noqa: E402
-from hfapi.session import Session, cookies_from_curl, parse_cookies  # noqa: E402
-
-MISSING = ("__client", "__client_uat")
-
+from hfapi.session import (  # noqa: E402
+    Session,
+    cookies_from_curl,
+    looks_like_curl,
+    parse_cookies,
+    require_session_cookies,
+)
 
 def _from_clipboard() -> str:
     if sys.platform == "win32":
@@ -60,9 +63,11 @@ def _segments(text: str) -> list[str]:
 
 
 def _parse(segment: str) -> dict[str, str]:
-    if re.search(r"-H\s+['\"]cookie:", segment, re.I) or re.search(r"(?:^|\s)(?:-b|--cookie)\s+['\"]", segment):
-        return cookies_from_curl(segment)
-    return parse_cookies(segment, source="输入")
+    if looks_like_curl(segment) or re.search(r"(?:^|\s)(?:-b|--cookie)\s+['\"]", segment):
+        cookies = cookies_from_curl(segment)
+    else:
+        cookies = parse_cookies(segment, source="输入")
+    return require_session_cookies(cookies, source="输入")
 
 
 def main() -> None:
@@ -107,9 +112,8 @@ def main() -> None:
         raise SystemExit(2)
 
     for cookies in parsed:
-        missing = [k for k in MISSING if k not in cookies]
-        if missing:
-            print(f"⚠️ 缺少 {missing} —— 多半是贴了 document.cookie，HttpOnly 的 __client 拿不到")
+        if "__client_uat" not in cookies:
+            print("提示：没有 __client_uat，一般仍可用（刷新 JWT 只依赖 __client）")
 
     # -- 落库
     if args.out:

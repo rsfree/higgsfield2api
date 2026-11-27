@@ -109,8 +109,10 @@ chmod 600 .env
 
 **推荐路径：面板**（不必登服务器）
 
-1. 浏览器登录 `higgsfield.ai` → DevTools → Network → 任意 XHR → 右键 **Copy as cURL**；
+1. 浏览器登录 `higgsfield.ai` → DevTools → Network → 筛 **`_clerk`** → 对 `v1/client` 请求右键 **Copy as cURL**；
    （每个号用独立 profile 或隐身窗口，别让 cookie 互相覆盖）
+   ⚠️ 别从 `fnf-api-gw.higgsfield.ai` 的请求上复制 —— 那里只有 `authorization: Bearer <JWT>`，
+   没有 `cookie:` 头。JWT 寿命 60 秒，且没有 `__client` 就无法换新，粘进去必然 401。
 2. 打开 `https://<域名>/panel` → 号池 → 粘贴 → **导入并自检**；
 3. 看到 `✓` 即通。`missing` 里若出现 `__client`，说明贴的是 `document.cookie`（拿不到 HttpOnly）。
 

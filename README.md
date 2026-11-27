@@ -74,7 +74,8 @@ cd higgsfield-magi2-api
 pip install -r requirements.txt
 cp .env.example .env
 
-# 1) 拿会话：浏览器登录 higgsfield.ai → DevTools → Network → 任意 XHR → Copy as cURL
+# 1) 拿会话：浏览器登录 higgsfield.ai → DevTools → Network → 筛 `_clerk` → 对 `v1/client` 请求 Copy as cURL
+#    注意：fnf-api-gw 的请求只带 Bearer JWT（60s 过期），不带 cookie，从那儿复制拿不到号
 #    存成 req.txt，然后：
 python -m tools.cookie_import --curl req.txt
 
